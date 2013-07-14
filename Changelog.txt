@@ -1,0 +1,48 @@
+
+RCS file: check_peerpoint,v
+Working file: check_peerpoint
+head: 1.7
+branch:
+locks: strict
+access list:
+symbolic names:
+keyword substitution: kv
+total revisions: 7;	selected revisions: 7
+description:
+nagios client script to look for specific registrations on a
+PeerPoint C100 SIP Session Border Controller
+----------------------------
+revision 1.7
+date: 2010/05/03 22:45:27;  author: shaug;  state: Exp;  lines: +26 -16
+converted from Net::SSH::Perl to Net::SSH2.  Net::SSH::Perl is no longer
+supported.
+----------------------------
+revision 1.6
+date: 2010/03/10 00:16:05;  author: shaug;  state: Exp;  lines: +3 -3
+fixed a tiny bug:  using a numerical comparison operation instead of
+string compare at line 204
+----------------------------
+revision 1.5
+date: 2009/11/17 01:02:06;  author: shaug;  state: Exp;  lines: +103 -45
+fixed the --list mode so that it actually reports registered clients &
+expirations.
+added new --mster mode that reports whether the given peerpoint is in
+master, standby, or neither mode.
+----------------------------
+revision 1.4
+date: 2007/09/14 01:39:36;  author: shaug;  state: Exp;  lines: +4 -3
+set a few ssh options to avoid maintaining an ssh known_hosts file
+----------------------------
+revision 1.3
+date: 2007/09/14 01:35:44;  author: shaug;  state: Exp;  lines: +21 -11
+converted from /usr/bin/ssh to Net::SSH::Perl
+----------------------------
+revision 1.2
+date: 2007/09/14 00:20:47;  author: shaug;  state: Exp;  lines: +40 -26
+added ability to match all registrations with "-r ''"
+added list mode, which shows all registered clients and their expirations
+----------------------------
+revision 1.1
+date: 2007/07/24 20:57:14;  author: shaug;  state: Exp;
+Initial revision
+=============================================================================

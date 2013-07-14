@@ -1,0 +1,286 @@
+#!/usr/bin/perl
+
+##
+# check_peerpoint - (c) 2007 O'Shaughnessy Evans <shaug-github at wumpus.org>
+# 
+# Check for known registrations on a PeerPoint C100 Session Border Controller
+# 
+# The C100 reports registrations like this:
+#     sip:nagios@proxy.808netfone.com:5060    [ V4 64.75.176.11:49916 ]        Reg TTL:751 secs       sipsak 0.9.6
+#     sip:nagios@proxy.808netfone.com:5060    [ V4 64.75.176.11:50555 ]        Reg TTL:3237 secs      sipsak 0.9.6
+#     sip:nagios@proxy.808netfone.com:5060    [ V4 64.75.176.11:51511 ]        Reg TTL:3536 secs      sipsak 0.9.6
+# 
+# We want to pull this list of registrations, then make sure our contact
+# field matches the 1st column and our registered endpoint matches the second.
+# 
+# $Id: check_peerpoint,v 1.7 2010/05/03 22:45:27 shaug Exp $
+##
+
+require 5.004;
+use strict;
+use POSIX;
+use Getopt::Long qw(:config no_ignore_case);
+use Sys::Hostname;
+use Net::SSH2;
+
+use lib '/usr/lib/nagios/plugins';
+use utils qw($TIMEOUT %ERRORS &print_revision &support);
+
+use vars qw($ME $VERSION %Flags $Help $Usage $Verbose
+            $Contact_Prefix $Contact_URI $Host $Registered_Host
+            $Get_Users_Cmd $Get_Failover_Cmd $Check_Registrations
+            $Is_Primary $Is_Master_Candidate
+            $SSH_Identity $SSH_User $SSH_BUFSIZE);
+
+BEGIN {
+  $VERSION = '0.'. (split(' ', '$Id: check_peerpoint,v 1.7 2010/05/03 22:45:27 shaug Exp $'))[2];
+  $ME = 'check_peerpoint';
+
+  # ssh connection info:  the identity should be usable without a passphrase
+  $SSH_Identity = '/etc/nagios3/ssh/id_dsa_open';
+  $SSH_User = 'nagios';
+  $SSH_BUFSIZE = '512';
+  $ENV{'HOME'} = '/var/lib/nagios';
+
+  # command to run on the peerpoint to pull the list of users
+  $Get_Users_Cmd = 'show users';
+
+  # command to run on the peerpoint to get failover status
+  $Get_Failover_Cmd = 'show failover';
+
+  $Contact_Prefix = 'sip:nagios@';
+  $Registered_Host = hostname();
+
+  # Are we in check-registrations mode or check-failover mode?
+  $Check_Registrations = 1;
+
+  $Usage = "$ME -H host [-c contact] [-r registered] [-i ssh_identity] [-u ssh_username] [-v]\n";
+  $Help = <<EOhelp;
+$ME:  Nagios plugin to check a PeerPoint C100 SBC
+
+Usage:
+  $ME [<flags>] -H peerpoint_host [-c contact_uri] [-r registered_host] [-i ssh_identity] [-u ssh_username] [-v]
+  $ME --help
+  $ME --man
+  $ME --version
+
+Options:
+  --contact|c    Contact URI to search for in the list of registered users
+                 (default is "$Contact_Prefix" followed by the hostname param).
+  --hostname|H   Hostname or IP of the PeerPoint to be checked.
+  --identity|i   ssh identity file for connecting to the PeerPoint
+                 (should have an empty passphrase;
+                 default $SSH_Identity).
+  --user|u       ssh username for connecting to the PeerPoint
+                 (should have a "reader" account on the C100; default $SSH_User).
+  --registered|r Hostname or IP that will be searched for in the registration
+                 (default is the Nagios server hostname).  If set to the
+                 empty string, all registered clients will be returned.
+  --list         List mode:  show all registered clients and their expirations
+  --master       Failover mode:  show whether the given server is the
+                 failover master (state OK), standby (state WARNING), or
+                 is never configured to be either (state UNKNOWN)
+  --verbose|v    Show details of progress (give more than once for more info).
+  --help         Show this usage text.
+  --man          Show the comprehensive documentation.
+  --version      Show the version ($VERSION).
+
+  This script will search the list of registered contacts on the named
+  PeerPoint C100 Session Border Controller.  If the hostname or IP given
+  in the "registered" option is found in the listings that match the given
+  "contact" option, then the script returns success.  If no matches are
+  found, the script returns failure.
+
+EOhelp
+}
+
+# handle the command-line
+$Verbose = 0;
+GetOptions('verbose|v+'     => \$Verbose,
+           'version|V'      => \$Flags{version},
+           'help|h'         => \$Flags{help},
+           'man|m'          => \$Flags{man},
+           'contact|c=s'    => \$Contact_URI,
+           'hostname|H=s'   => \$Host,
+           'identity|i=s'   => \$SSH_Identity,
+           'list|l'         => \$Flags{list_mode},
+           'master|M'       => \$Flags{is_master},
+           'registered|r=s' => \$Registered_Host,
+           'user|u=s'       => \$SSH_User,
+          )
+ or die($Usage);
+if ($Flags{version}) {
+    print_revision($ME, $VERSION);
+    exit 0;
+}
+elsif ($Flags{help}) {
+    print $Help;
+    exit 0;
+}
+elsif ($Flags{man}) {
+    use Pod::Usage;
+    pod2usage(-verbose => 2, -exitval => 0);
+}
+
+my $cmd;
+if ($Flags{is_master} or $Flags{is_slave}) {
+    $Check_Registrations = 0;
+    $cmd = $Get_Failover_Cmd;
+}
+else {
+    $cmd = $Get_Users_Cmd;
+}
+
+# check command-line arguments:
+# make sure the test host is given and usable
+if (! $Host) {
+    print "ERROR:  Sorry, but a hostname to test must be given.\n\n".
+          $Usage;
+    exit $ERRORS{UNKNOWN};
+}
+elsif ($Host and ! utils::is_hostname($Host)) {
+    print "ERROR:  Sorry, but \"$Host\" doesn't look like a host name.\n\n".
+          $Usage;
+    exit $ERRORS{UNKNOWN};
+}
+
+# make sure the registration host is an IP or hostname
+if ($Registered_Host && !utils::is_hostname($Registered_Host)) {
+    print "ERROR:  Sorry, but \"$Registered_Host\" doesn't look like a host ".
+          "name.\n\n". $Usage;
+    exit $ERRORS{UNKNOWN};
+}
+
+# set the contact to the default if it wasn't given
+if (!$Contact_URI) {
+    $Contact_URI = $Contact_Prefix. $Host;
+}
+
+# add -v flags to the ssh command according to the verbosity given on the
+# command line
+my $cmd_flags;
+for (my $v = 2; $v < $Verbose; $v++) {
+    $cmd_flags .= ' -v';
+}
+
+if ($Verbose) {
+    print "Looking at registrations on $Host:\n".
+          "    contact $Contact_URI\n".
+          "    client $Registered_Host\n\n";
+}
+
+my $ssh = Net::SSH2->new()
+ or die("couldn't create new ssh object: $!\n");
+$ssh->connect($Host)
+ or die("couldn't connect to ssh service: $!\n");
+print "connecting... \n" if $Verbose;
+$ssh->auth_publickey($SSH_User, $SSH_Identity.'.pub', $SSH_Identity)
+ or die("couldn't create new ssh object: $!\n");
+my $ssh_channel = $ssh->channel();
+
+#$ssh->login($SSH_User) or die("couldn't log in to $Host: $!\n");
+
+print "executing \"$cmd\"... \n" if $Verbose;
+$ssh_channel->exec($cmd);
+my $out = '';
+my $buf = '';
+while (not $ssh_channel->eof()) {
+    $ssh_channel->read($buf, $SSH_BUFSIZE);
+    $out .= $buf;
+}
+my @out = split("\n", $out);
+
+# Process our command output in different ways depending on what mode we're in.
+my $match = 0;
+my (@expires, @clients);
+if ($Check_Registrations) {
+    my ($this_contact, $this_client, $this_exp);
+    foreach my $out (@out) {
+        chomp $out;
+        next unless $out =~ /^(sip\S+)\s+\[ \w+ ([\d.]+):\d+ \] .* Reg TTL:(\d+)/;
+        $this_contact = $1;
+        $this_client = $2;
+        $this_exp = $3;
+
+        print "searching ($out)\n" if $Verbose > 2;
+        if ($Flags{list_mode}) {
+            push @expires, $this_exp;
+            push @clients, $this_client;
+        }
+        else {
+            print "comparing with contact ($this_contact), client ($this_client)\n"
+             if $Verbose > 1;
+            if ($this_contact eq $Contact_URI) {
+                next if $Registered_Host and $this_client ne $Registered_Host;
+                print "matched registration:  $out\n" if $Verbose;
+                $match++;
+                push @expires, $this_exp;
+                push @clients, $this_client;
+            }
+        }
+    }
+}
+elsif ($Flags{is_master}) {
+    my ($this_int, $this_ip);
+    $Is_Master_Candidate = 0;
+    foreach my $out (@out) {
+        chomp $out;
+
+        if ($out =~ /^failover become master/) {
+            $Is_Master_Candidate = 1;
+            next;
+        }
+
+        next unless $out =~ /^\|\s+i(\d+)\s+\d+\s+(\S+)\s+\d+$/;
+        $this_int = $1;
+        $this_ip = $2;
+        $Is_Primary = $this_ip eq '<this_machine>';
+    }
+}
+
+my ($state, $answer);
+if ($Flags{list_mode}) {
+    foreach my $c (@clients) {
+        my $exp = shift @expires;
+        print "client $c expires in ${exp}s\n";
+    }
+
+    exit;
+}
+elsif ($Flags{is_master}) {
+    if ($Is_Primary) {
+        $state = $ERRORS{OK};
+        $answer = "This machine is the current master.";
+    }
+    elsif ($Is_Master_Candidate) {
+        $state = $ERRORS{WARNING};
+        $answer = "This machine is the failover standby.";
+    }
+    else {
+        $state = $ERRORS{UNKNOWN};
+        $answer = "This machine is not the master, but is not configured to become master either.";
+    }
+}
+else {
+    if ($match) {
+        $state = $ERRORS{OK};
+        @expires = sort { $a <=> $b } @expires;
+        $answer = "expirations:  @expires\n";
+    }
+    else {
+        $state = $ERRORS{CRITICAL};
+        $answer = "no registrations matched contact $Contact_URI".
+                  ($Registered_Host ? " and client $Registered_Host\n" : "\n");
+    }
+}
+
+foreach my $errname (keys %ERRORS) {
+    print " $errname" if $Verbose > 2;
+    if ($state == $ERRORS{$errname}) {
+        print "\n" if $Verbose > 2;
+        print "$errname: $answer\n";
+        last;
+    }
+}
+
+exit $state;
